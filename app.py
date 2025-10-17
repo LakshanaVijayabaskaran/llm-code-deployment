@@ -324,6 +324,7 @@ def deploy_to_github(workdir: Path, payload: TaskRequest):
     if not site_dir.exists():
         raise Exception("❌ Site directory not found — cannot deploy.")
 
+    # Move site files to workdir root
     log(f"📦 Moving site contents from {site_dir} to {workdir}")
     for item in site_dir.iterdir():
         target = workdir / item.name
@@ -335,27 +336,23 @@ def deploy_to_github(workdir: Path, payload: TaskRequest):
         shutil.move(str(item), str(target))
     shutil.rmtree(site_dir)
 
+    # Secret scan
     try:
         scan_for_secrets(workdir)
     except Exception as e:
         log(f"⚠️ Secret scan failed/skipped: {e}")
 
+    # Sanitize repo name
     repo_base = f"llm-task-{payload.task}"
     repo = sanitize_repo_name(repo_base)
 
-    try:
-        run_shell(f"gh repo view {GITHUB_USERNAME}/{repo}")
-        short_nonce = payload.nonce[:6]
-        repo = f"{repo}-{short_nonce}"
-        log(f"ℹ️ Repo already exists, using new name: {repo}")
-    except Exception:
-        log(f"✅ Repo name available: {repo}")
-
+    # Add LICENSE if missing
     license_file = workdir / "LICENSE"
     if not license_file.exists():
         license_file.write_text("MIT License\nCopyright 2025")
         log("🪪 LICENSE file created.")
 
+    # Init git if missing
     if not (workdir / ".git").exists():
         run_shell("git init", cwd=workdir)
         run_shell("git branch -M main", cwd=workdir)
@@ -365,52 +362,44 @@ def deploy_to_github(workdir: Path, payload: TaskRequest):
 
     run_shell("git add .", cwd=workdir)
     status = run_shell("git status --porcelain", cwd=workdir)
-    commit_sha = None  # default if no commit is made
+    commit_sha = None
     if status.strip():
         run_shell('git commit -m "Deploy app"', cwd=workdir)
         commit_sha = run_shell("git rev-parse HEAD", cwd=workdir)
         log(f"✅ Changes committed. Commit SHA: {commit_sha}")
-        log("✅ Changes committed.")
     else:
-        log("⚠️ No changes to commit (skipping commit step).")
+        log("⚠️ No changes to commit.")
+        commit_sha = run_shell("git rev-parse HEAD", cwd=workdir)
 
-    commit_sha = run_shell("git rev-parse HEAD", cwd=workdir)
-
+    # Push using HTTPS token
+    remote_url = f"https://{GITHUB_USERNAME}:{GITHUB_TOKEN}@github.com/{GITHUB_USERNAME}/{repo}.git"
     try:
-        run_shell(f"gh repo create {GITHUB_USERNAME}/{repo} --public --source . --remote origin --push", cwd=workdir)
-        log("✅ Repository created and pushed successfully.")
+        run_shell(f"git remote remove origin || true", cwd=workdir)
+        run_shell(f"git remote add origin {remote_url}", cwd=workdir)
+        run_shell("git push -u origin main --force", cwd=workdir)
+        log("✅ Repo pushed successfully via HTTPS token")
     except Exception as e:
-        log(f"⚠️ Repo creation failed: {e}")
-        run_shell(f"git remote add origin https://github.com/{GITHUB_USERNAME}/{repo}.git", cwd=workdir)
-        run_shell("git push -u origin main", cwd=workdir)
-        log("✅ Repo pushed using fallback remote.")
+        log(f"❌ Git push failed: {e}")
+        raise
 
-    # -----------------------------
-    # Generic GitHub Pages deployment
-    # -----------------------------
-    pages_payload = {
-        "source": {
-            "branch": "main",
-            "path": "/"
-        }
-    }
+    # GitHub Pages deployment via REST API
+    pages_url = f"https://{GITHUB_USERNAME}.github.io/{repo}/"
+    pages_api = f"https://api.github.com/repos/{GITHUB_USERNAME}/{repo}/pages"
+    payload_json = {"source": {"branch": "main", "path": "/"}}
 
-    pages_file = workdir / "pages.json"
-    pages_file.write_text(json.dumps(pages_payload))
-
+    headers = {"Authorization": f"token {GITHUB_TOKEN}", "Accept": "application/vnd.github+json"}
     try:
-        run_shell(
-    f'gh api -X POST repos/{GITHUB_USERNAME}/{repo}/pages '
-    f'-H "Accept: application/vnd.github+json" --input {pages_file.absolute()}',
-    cwd=workdir
-)
-        log("🌐 GitHub Pages enabled successfully (modern API)")
+        resp = requests.post(pages_api, headers=headers, json=payload_json, timeout=60)
+        if resp.status_code in [201, 202]:
+            log(f"🌐 GitHub Pages enabled successfully: {pages_url}")
+        elif resp.status_code == 409:
+            log("ℹ️ GitHub Pages already exists, skipping creation.")
+        else:
+            log(f"⚠️ GitHub Pages API responded: {resp.status_code} {resp.text}")
     except Exception as e:
-        log(f"⚠️ GitHub Pages enable failed: {e}")
-
+        log(f"❌ GitHub Pages deployment failed: {e}")
 
     repo_url = f"https://github.com/{GITHUB_USERNAME}/{repo}"
-    pages_url = f"https://{GITHUB_USERNAME}.github.io/{repo}/"
     log(f"✅ Deployment complete:\nRepo: {repo_url}\nPages: {pages_url}")
 
     return repo_url, commit_sha.strip(), pages_url
