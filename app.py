@@ -514,7 +514,10 @@ async def handle_request(payload: TaskRequest, background_tasks: BackgroundTasks
 
     # ✅ Return deployment info
     return {
-        "status": "success",
+        "email": payload.email,
+        "task": payload.task,
+        "round": payload.round,
+        "nonce": payload.nonce,
         "repo_url": repo_url,
         "commit_sha": commit_sha,
         "pages_url": pages_url
@@ -674,7 +677,10 @@ async def handle_round2(payload: TaskRequest):
     log("⏳ Round 2 deployment started in background")
 
     return {
-        "status": "success",
+        "email": payload.email,
+        "task": payload.task,
+        "round": 2,
+        "nonce": payload.nonce,
         "repo_url": f"https://github.com/{GITHUB_USERNAME}/llm-task-{payload.task}",
         "pages_url": f"https://{GITHUB_USERNAME}.github.io/llm-task-{payload.task}/"
     }
