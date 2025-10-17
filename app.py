@@ -319,12 +319,19 @@ def scan_for_secrets(site_dir: Path):
     log("✅ Secret scan passed")
 
 
+import shutil
+import json
+import requests
+from pathlib import Path
+
 def deploy_to_github(workdir: Path, payload: TaskRequest):
     site_dir = workdir / "site"
     if not site_dir.exists():
         raise Exception("❌ Site directory not found — cannot deploy.")
 
+    # -------------------------
     # Move site files to workdir root
+    # -------------------------
     log(f"📦 Moving site contents from {site_dir} to {workdir}")
     for item in site_dir.iterdir():
         target = workdir / item.name
@@ -336,23 +343,31 @@ def deploy_to_github(workdir: Path, payload: TaskRequest):
         shutil.move(str(item), str(target))
     shutil.rmtree(site_dir)
 
+    # -------------------------
     # Secret scan
+    # -------------------------
     try:
         scan_for_secrets(workdir)
     except Exception as e:
         log(f"⚠️ Secret scan failed/skipped: {e}")
 
+    # -------------------------
     # Sanitize repo name
+    # -------------------------
     repo_base = f"llm-task-{payload.task}"
     repo = sanitize_repo_name(repo_base)
 
+    # -------------------------
     # Add LICENSE if missing
+    # -------------------------
     license_file = workdir / "LICENSE"
     if not license_file.exists():
         license_file.write_text("MIT License\nCopyright 2025")
         log("🪪 LICENSE file created.")
 
+    # -------------------------
     # Init git if missing
+    # -------------------------
     if not (workdir / ".git").exists():
         run_shell("git init", cwd=workdir)
         run_shell("git branch -M main", cwd=workdir)
@@ -360,9 +375,11 @@ def deploy_to_github(workdir: Path, payload: TaskRequest):
     run_shell(f'git config user.name "{GITHUB_USERNAME}"', cwd=workdir)
     run_shell('git config user.email "actions@github.com"', cwd=workdir)
 
+    # -------------------------
+    # Commit changes
+    # -------------------------
     run_shell("git add .", cwd=workdir)
     status = run_shell("git status --porcelain", cwd=workdir)
-    commit_sha = None
     if status.strip():
         run_shell('git commit -m "Deploy app"', cwd=workdir)
         commit_sha = run_shell("git rev-parse HEAD", cwd=workdir)
@@ -371,10 +388,27 @@ def deploy_to_github(workdir: Path, payload: TaskRequest):
         log("⚠️ No changes to commit.")
         commit_sha = run_shell("git rev-parse HEAD", cwd=workdir)
 
+    # -------------------------
+    # Ensure repo exists on GitHub
+    # -------------------------
+    create_repo_api = "https://api.github.com/user/repos"
+    headers = {"Authorization": f"token {GITHUB_TOKEN}", "Accept": "application/vnd.github+json"}
+    data = {"name": repo, "private": False}
+
+    resp = requests.post(create_repo_api, headers=headers, json=data, timeout=30)
+    if resp.status_code == 201:
+        log(f"✅ GitHub repo '{repo}' created successfully.")
+    elif resp.status_code == 422:
+        log(f"ℹ️ GitHub repo '{repo}' already exists, skipping creation.")
+    else:
+        log(f"⚠️ Failed to create repo '{repo}': {resp.status_code} {resp.text}")
+
+    # -------------------------
     # Push using HTTPS token
+    # -------------------------
     remote_url = f"https://{GITHUB_USERNAME}:{GITHUB_TOKEN}@github.com/{GITHUB_USERNAME}/{repo}.git"
     try:
-        run_shell(f"git remote remove origin || true", cwd=workdir)
+        run_shell("git remote remove origin || true", cwd=workdir)
         run_shell(f"git remote add origin {remote_url}", cwd=workdir)
         run_shell("git push -u origin main --force", cwd=workdir)
         log("✅ Repo pushed successfully via HTTPS token")
@@ -382,12 +416,13 @@ def deploy_to_github(workdir: Path, payload: TaskRequest):
         log(f"❌ Git push failed: {e}")
         raise
 
+    # -------------------------
     # GitHub Pages deployment via REST API
+    # -------------------------
     pages_url = f"https://{GITHUB_USERNAME}.github.io/{repo}/"
     pages_api = f"https://api.github.com/repos/{GITHUB_USERNAME}/{repo}/pages"
     payload_json = {"source": {"branch": "main", "path": "/"}}
 
-    headers = {"Authorization": f"token {GITHUB_TOKEN}", "Accept": "application/vnd.github+json"}
     try:
         resp = requests.post(pages_api, headers=headers, json=payload_json, timeout=60)
         if resp.status_code in [201, 202]:
@@ -403,6 +438,7 @@ def deploy_to_github(workdir: Path, payload: TaskRequest):
     log(f"✅ Deployment complete:\nRepo: {repo_url}\nPages: {pages_url}")
 
     return repo_url, commit_sha.strip(), pages_url
+
 
 
 # ---------------------------
