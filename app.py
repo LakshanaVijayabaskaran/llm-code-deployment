@@ -27,6 +27,7 @@ AIPIPE_TOKEN = os.getenv("AIPIPE_TOKEN")
 AIPIPE_BASE = os.getenv("AIPIPE_BASE", "https://aipipe.org/openai/v1")
 AIPIPE_MODEL = os.getenv("AIPIPE_MODEL", "gpt-4o-mini")
 EVALUATION_SECRET = os.getenv("EVALUATION_SECRET", "")
+EVAL_URL = os.getenv("EVAL_URL")
 
 
 # ---------------------------
@@ -425,75 +426,68 @@ deployment_results: Dict[str, Dict[str, str]] = {}  # nonce -> repo_url, commit_
 # ---------------------------
 @app.post("/api/request", response_model=StatusResponse)
 async def handle_request(payload: TaskRequest, background_tasks: BackgroundTasks):
+    # ✅ Validate secret
     if payload.secret != STUDENT_SECRET:
         raise HTTPException(status_code=400, detail="Invalid student secret")
 
+    # ✅ Fallback for evaluation_url (use .env default)
+    if not payload.evaluation_url:
+        payload.evaluation_url = EVAL_URL
+        log(f"⚙️ Using default evaluation URL: {EVAL_URL}")
+    else:
+        log(f"✅ Using provided evaluation URL: {payload.evaluation_url}")
+
     log(f"✅ Task received: {payload.task} (Round {payload.round})")
+
     workdir = Path(f"workdir_{payload.nonce}")
     workdir.mkdir(exist_ok=True)
 
+    # Save attachments (if any)
     if payload.attachments:
         save_attachments(payload.attachments, workdir)
 
+    # Generate app (via LLM or template fallback)
     llm_ok = generate_with_llm(payload, workdir)
     if not llm_ok:
         template_id = detect_template(payload.brief)
         generate_static_app(template_id, payload, workdir)
 
-    # Background deployment
-    def deploy_task():
-        try:
-            repo_url, commit_sha, pages_url = deploy_to_github(workdir, payload)
-            deployment_results[payload.nonce] = {
-                "repo_url": repo_url,
-                "commit_sha": commit_sha,
-                "pages_url": pages_url,
-            }
-            log(f"Deployment finished. Pages URL: {pages_url}")
+    # 🚀 Deploy to GitHub
+    try:
+        repo_url, commit_sha, pages_url = deploy_to_github(workdir, payload)
+        deployment_results[payload.nonce] = {
+            "repo_url": repo_url,
+            "commit_sha": commit_sha,
+            "pages_url": pages_url,
+        }
+        log(f"✅ Deployment finished. Pages URL: {pages_url}")
+    except Exception as e:
+        log(f"❌ Deployment failed: {e}")
+        deployment_results[payload.nonce] = {"error": str(e)}
+        raise HTTPException(status_code=500, detail=f"Deployment failed: {e}")
 
-            # Notify evaluation server if provided
-            if payload.evaluation_url:
-                try:
-                    requests.post(
-                        payload.evaluation_url,
-                        headers={"Content-Type": "application/json"},
-                        json={
-                            "email": payload.email,
-                            "task": payload.task,
-                            "round": payload.round,
-                            "nonce": payload.nonce,
-                            "repo_url": repo_url,
-                            "commit_sha": commit_sha,
-                            "pages_url": pages_url,
-                        },
-                        timeout=600
-                    )
-                    log("✅ Evaluation server notified successfully")
-                except Exception as e:
-                    log(f"❌ Failed to notify evaluation server: {e}")
-
-        except Exception as e:
-            log(f"Deployment failed: {e}")
-            deployment_results[payload.nonce] = {"error": str(e)}
-
-    repo_url, commit_sha, pages_url = deploy_to_github(workdir, payload)
-
-    # Notify evaluation server immediately
+    # 📢 Notify evaluation server (if URL available)
     if payload.evaluation_url:
-        requests.post(
-            payload.evaluation_url,
-            headers={"Content-Type": "application/json"},
-            json={
-                "email": payload.email,
-                "task": payload.task,
-                "round": payload.round,
-                "nonce": payload.nonce,
-                "repo_url": repo_url,
-                "commit_sha": commit_sha,
-                "pages_url": pages_url,
-            },
-            timeout=600
-        )
+        try:
+            response = requests.post(
+                payload.evaluation_url,
+                headers={"Content-Type": "application/json"},
+                json={
+                    "email": payload.email,
+                    "task": payload.task,
+                    "round": payload.round,
+                    "nonce": payload.nonce,
+                    "repo_url": repo_url,
+                    "commit_sha": commit_sha,
+                    "pages_url": pages_url,
+                },
+                timeout=600
+            )
+            log(f"✅ Evaluation server notified: {response.status_code}")
+        except Exception as e:
+            log(f"⚠️ Could not notify evaluation server: {e}")
+
+    # ✅ Return deployment info
     return {
         "status": "success",
         "repo_url": repo_url,
@@ -543,35 +537,36 @@ import threading
 async def handle_round2(payload: TaskRequest):
     if payload.secret != STUDENT_SECRET:
         raise HTTPException(status_code=400, detail="Invalid student secret")
+    if not payload.evaluation_url:
+        payload.evaluation_url = EVAL_URL
+        log(f"⚙️ Using default evaluation URL: {EVAL_URL}")
 
     log(f"✅ Round 2 task received: {payload.task}")
     workdir = Path(f"workdir_{payload.nonce}")
     workdir.mkdir(exist_ok=True)
 
-    # Step 1: Save attachments
     if payload.attachments:
         save_attachments(payload.attachments, workdir)
 
-    # Step 2: Generate/update files
     llm_ok = generate_with_llm(payload, workdir)
     if not llm_ok:
         template_id = detect_template(payload.brief)
         generate_static_app(template_id, payload, workdir)
 
-    # Step 3: Update README.md
     readme_file = workdir / "README.md"
-    readme_content = f"# Task {payload.task} - Round 2\n\n"
-    readme_content += f"Updated features based on brief:\n{payload.brief}\n"
-    readme_file.write_text(readme_content, encoding="utf-8")
+    readme_file.write_text(
+        f"# Task {payload.task} - Round 2\n\nUpdated features based on brief:\n{payload.brief}\n",
+        encoding="utf-8"
+    )
     log("📝 README.md updated for Round 2")
 
-    # Step 4: Background deployment
     def _deploy():
         try:
             repo_name = f"llm-task-{payload.task}"
+            repo_url = f"https://github.com/{GITHUB_USERNAME}/{repo_name}"
+            pages_url = f"https://{GITHUB_USERNAME}.github.io/{repo_name}/"
             remote_url = f"https://{GITHUB_TOKEN}@github.com/{GITHUB_USERNAME}/{repo_name}.git"
 
-            # --- Git setup ---
             if not (workdir / ".git").exists():
                 run_shell("git init", cwd=workdir)
                 run_shell("git branch -M main", cwd=workdir)
@@ -579,45 +574,27 @@ async def handle_round2(payload: TaskRequest):
             run_shell(f'git config user.name "{GITHUB_USERNAME}"', cwd=workdir)
             run_shell('git config user.email "actions@github.com"', cwd=workdir)
 
-            remotes = run_shell("git remote", cwd=workdir).splitlines()
-            if "origin" not in remotes:
-                run_shell(f"git remote add origin {remote_url}", cwd=workdir)
-            else:
-                run_shell(f"git remote set-url origin {remote_url}", cwd=workdir)
-
-            # --- Fetch & merge existing repo ---
             try:
                 run_shell("git fetch origin main", cwd=workdir)
                 run_shell("git merge origin/main --allow-unrelated-histories -m 'Round 2 merge'", cwd=workdir)
-                log("✅ Merge with remote successful")
-            except Exception as merge_exc:
-                log(f"⚠️ Merge failed: {merge_exc}. Proceeding with local changes only.")
+            except Exception:
+                log("ℹ️ No existing remote branch to merge, skipping")
 
-            # --- Commit changes ---
-            status = run_shell("git status --porcelain", cwd=workdir)
-            if status.strip():
-                run_shell('git add .', cwd=workdir)
-                run_shell('git commit -m "Round 2 updates"', cwd=workdir)
-                log("✅ Round 2 changes committed")
-            else:
-                log("⚠️ No changes detected to commit for Round 2")
+            if run_shell("git status --porcelain", cwd=workdir).strip():
+                run_shell("git add .", cwd=workdir)
+                run_shell(f'git commit -m "Round 2 update ({datetime.now().isoformat()})"', cwd=workdir)
 
-            # --- Push to GitHub ---
-            run_shell("git push origin main", cwd=workdir)
-            log("✅ Changes pushed to GitHub (Round 2)")
+            run_shell("git push origin main --force", cwd=workdir)
+            log("✅ Pushed changes to GitHub")
 
-            # --- GitHub Pages redeploy ---
             pages_payload = {"source": {"branch": "main", "path": "/"}}
-            pages_file = workdir / "pages.json"
-            pages_file.write_text(json.dumps(pages_payload))
+            (workdir / "pages.json").write_text(json.dumps(pages_payload))
             run_shell(
                 f'gh api -X PUT repos/{GITHUB_USERNAME}/{repo_name}/pages '
-                f'-H "Accept: application/vnd.github+json" --input {pages_file.absolute()}',
+                f'-H "Accept: application/vnd.github+json" --input pages.json',
                 cwd=workdir
             )
-            log("🌐 GitHub Pages redeployed successfully")
 
-            # --- Notify evaluation server ---
             try:
                 resp = requests.post(
                     payload.evaluation_url,
@@ -627,13 +604,13 @@ async def handle_round2(payload: TaskRequest):
                         "task": payload.task,
                         "round": 2,
                         "nonce": payload.nonce,
-                        "repo_url": f"https://github.com/{GITHUB_USERNAME}/llm-task-{payload.task}",
+                        "repo_url": repo_url,
                         "commit_sha": run_shell("git rev-parse HEAD", cwd=workdir),
-                        "pages_url": f"https://{GITHUB_USERNAME}.github.io/llm-task-{payload.task}/"
+                        "pages_url": pages_url,
                     },
                     timeout=600
                 )
-                if resp.status_code == 200:
+                if resp.ok:
                     log("✅ Evaluation server notified successfully for Round 2")
                 else:
                     log(f"⚠️ Evaluation server responded: {resp.status_code}")
@@ -643,10 +620,13 @@ async def handle_round2(payload: TaskRequest):
         except Exception as e:
             log(f"❌ Round 2 deployment failed: {e}")
 
-    # Run deployment in background thread
     threading.Thread(target=_deploy, daemon=True).start()
-    return {"status": "success"}
 
+    return {
+        "status": "success",
+        "repo_url": f"https://github.com/{GITHUB_USERNAME}/llm-task-{payload.task}",
+        "pages_url": f"https://{GITHUB_USERNAME}.github.io/llm-task-{payload.task}/"
+    }
 
 
 @app.post("/api/evaluate")
