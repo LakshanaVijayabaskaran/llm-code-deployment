@@ -514,6 +514,7 @@ async def handle_request(payload: TaskRequest, background_tasks: BackgroundTasks
 
     # ✅ Return deployment info
     return {
+        "status": "success",
         "email": payload.email,
         "task": payload.task,
         "round": payload.round,
@@ -677,6 +678,7 @@ async def handle_round2(payload: TaskRequest):
     log("⏳ Round 2 deployment started in background")
 
     return {
+        "status": "success",
         "email": payload.email,
         "task": payload.task,
         "round": 2,
